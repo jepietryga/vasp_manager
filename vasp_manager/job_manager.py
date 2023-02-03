@@ -53,16 +53,18 @@ class JobManager:
     def mode(self):
         return os.path.basename(self.calc_path)
 
-    @cached_property
+    @property
     def job_exists(self):
         jobid_path = os.path.join(self.calc_path, "jobid")
-        if os.path.exists(jobid_path):
-            with open(jobid_path) as fr:
-                jobid = fr.read().strip()
-            self.jobid = jobid
-            return True
-        else:
+        if not os.path.exists(jobid_path):
             return False
+        if os.path.getsize(jobid_path) == 0:
+            return False
+
+        with open(jobid_path) as fr:
+            jobid = fr.read().strip()
+        self.jobid = jobid
+        return True
 
     @property
     def jobid(self):
@@ -77,7 +79,7 @@ class JobManager:
         try:
             jobid_int = int(job_value)
         except Exception as e:
-            raise Exception(f"{e}")
+            raise Exception(f"Tried to set jobid={job_value}\n{e}")
         self._jobid = jobid_int
 
     def submit_job(self):
@@ -102,11 +104,17 @@ class JobManager:
             # know that the calculation needs to be restarted
             return False
 
-        submission_call = "sbatch vasp.q | awk '{ print $4 }' | tee jobid"
+        submission_call = "sbatch vasp.q | awk '{ print $4 }'"
         with change_directory(self.calc_path):
-            jobid = subprocess.check_output(submission_call, shell=True).decode("utf-8")
+            jobid = (
+                subprocess.check_output(submission_call, shell=True)
+                .decode("utf-8")
+                .strip()
+            )
+            self.jobid = jobid
+            with open("jobid", "w+") as fw:
+                fw.write(jobid)
         logger.info(f"Submitted job {jobid}")
-        self.jobid = jobid
         return True
 
     @property
@@ -124,15 +132,15 @@ class JobManager:
             # This enables job resubmission by letting the calling function
             # continue anyways
             return True
-        else:
-            check_queue_call = f"squeue -u {self.user_id}"
-            queue_call = (
-                subprocess.check_output(check_queue_call, shell=True)
-                .decode("utf-8")
-                .splitlines()
-            )
-            for line in queue_call:
-                line = line.strip().split()
-                if str(self.jobid) in line:
-                    return False
-            return True
+
+        check_queue_call = f"squeue -u {self.user_id}"
+        queue_call = (
+            subprocess.check_output(check_queue_call, shell=True)
+            .decode("utf-8")
+            .splitlines()
+        )
+        for line in queue_call:
+            line = line.strip().split()
+            if str(self.jobid) in line:
+                return False
+        return True

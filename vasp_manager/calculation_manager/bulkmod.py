@@ -10,7 +10,7 @@ import numpy as np
 
 from vasp_manager.analyzer.bulkmod_analyzer import BulkmodAnalyzer
 from vasp_manager.calculation_manager.base import BaseCalculationManager
-from vasp_manager.utils import change_directory, ptail
+from vasp_manager.utils import change_directory, pgrep
 from vasp_manager.vasp_input_creator import VaspInputCreator
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,7 @@ class BulkmodCalculationManager(BaseCalculationManager):
         material_path,
         to_rerun,
         to_submit,
+        primitive=True,
         ignore_personal_errors=True,
         from_relax=True,
         from_scratch=False,
@@ -41,18 +42,21 @@ class BulkmodCalculationManager(BaseCalculationManager):
             strains (array-like): optional, fractional strain along each axis for
                 each deformation
                 if None, use default
-                default is np.linspace(start=0.8, stop=1.2, number=11)**(1/3)
+                default is np.linspace(start=0.925, stop=1.075, number=11)**(1/3)
                 len(strains) must be odd and strains must be centered around 0
         """
         self.from_relax = from_relax
         self.strains = (
-            strains if strains is not None else np.power(np.linspace(0.8, 1.2, 11), 1 / 3)
+            strains
+            if strains is not None
+            else np.power(np.linspace(0.925, 1.075, 11), 1 / 3)
         )
         self.tail = tail
         super().__init__(
             material_path=material_path,
             to_rerun=to_rerun,
             to_submit=to_submit,
+            primitive=primitive,
             ignore_personal_errors=ignore_personal_errors,
             from_scratch=from_scratch,
         )
@@ -74,6 +78,16 @@ class BulkmodCalculationManager(BaseCalculationManager):
             poscar_source_path = os.path.join(self.material_path, "POSCAR")
         return poscar_source_path
 
+    @cached_property
+    def vasp_input_creator(self):
+        return VaspInputCreator(
+            self.calc_path,
+            mode=self.mode,
+            poscar_source_path=self.poscar_source_path,
+            primitive=self.primitive,
+            name=self.material_name,
+        )
+
     @property
     def strains(self):
         return self._strains
@@ -86,7 +100,7 @@ class BulkmodCalculationManager(BaseCalculationManager):
             raise ValueError(f"Strains not centered around 1.0: middle is {middle}")
         self._strains = values
 
-    def setup_calc(self):
+    def setup_calc(self, increase_nodes_by_factor=1):
         """
         Sets up an EOS bulkmod calculation
         """
@@ -96,14 +110,9 @@ class BulkmodCalculationManager(BaseCalculationManager):
                 "\n\t starting structure must be fairly close to equilibrium volume!"
             )
             logger.warning(msg)
-        vasp_input_creator = VaspInputCreator(
-            self.calc_path,
-            mode=self.mode,
-            poscar_source_path=self.poscar_source_path,
-            name=self.material_name,
-        )
-        vasp_input_creator.create()
 
+        self.vasp_input_creator.increase_nodes_by_factor = increase_nodes_by_factor
+        self.vasp_input_creator.create()
         self._make_bulkmod_strains()
 
         if self.to_submit:
@@ -129,13 +138,36 @@ class BulkmodCalculationManager(BaseCalculationManager):
             strain_name = f"strain_{strain_index}"
             strain_path = os.path.join(self.calc_path, strain_name)
             stdout_path = os.path.join(strain_path, "stdout.txt")
+            stderr_path = os.path.join(strain_path, "stderr.txt")
             if not os.path.exists(stdout_path):
                 return False
 
-            tail_output = ptail(stdout_path, n_tail=self.tail, as_string=True)
-            if "1 F=" not in tail_output:
+            vasp_errors = self._check_vasp_errors(
+                stdout_path=stdout_path, stderr_path=stderr_path
+            )
+            if len(vasp_errors) > 0:
+                all_errors_addressed = self._address_vasp_errors(vasp_errors)
+                if not all_errors_addressed:
+                    msg = (
+                        f"{self.mode.upper()} Calculation: ",
+                        "Couldn't address all VASP Errors\n",
+                        "\tRefusing to continue...\n",
+                        f"\tVasp Errors: {vasp_errors}\n",
+                    )
+                    raise RuntimeError(msg)
                 if self.to_rerun:
+                    logger.info(f"Rerunning {self.calc_path}")
+                    self._from_scratch()
                     self.setup_calc()
+                return False
+
+            grep_output = pgrep(stdout_path, "1 F=", stop_after_first_match=True)
+            if len(grep_output) == 0:
+                if self.to_rerun:
+                    logger.info(f"Rerunning {self.calc_path}")
+                    # increase nodes as its likely the calculation failed
+                    self._from_scratch()
+                    self.setup_calc(increase_nodes_by_factor=2)
                 return False
         return True
 

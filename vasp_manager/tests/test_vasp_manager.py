@@ -38,6 +38,7 @@ def test_vmg_in_order(tmpdir):
         vmg = VaspManager(
             calculation_types=calculation_type_subset,
             material_paths=material_paths,
+            use_multiprocessing=True,
             to_rerun=True,
             to_submit=True,
         )
@@ -48,8 +49,10 @@ def test_vmg_in_order(tmpdir):
             for material in results:
                 for pc in previous_calc_types:
                     match pc:
-                        case "rlx-coarse" | "rlx":
+                        case "rlx-coarse":
                             assert results[material][pc] == "done"
+                        case "rlx":
+                            assert isinstance(results[material][pc]["total_dV"], float)
                         case "static":
                             assert isinstance(
                                 results[material][pc]["final_energy"], float
@@ -82,7 +85,9 @@ def test_vmg_in_order(tmpdir):
     results = vmg.run_calculations()
     for material in results:
         assert results[material]["rlx-coarse"] == "done"
-        assert results[material]["rlx"] == "done"
+        assert isinstance(results[material]["rlx"]["initial_spacegroup"], int)
+        assert isinstance(results[material]["rlx"]["relaxed_spacegroup"], int)
+        assert isinstance(results[material]["rlx"]["total_dV"], float)
         assert isinstance(results[material]["static"]["final_energy"], float)
         assert isinstance(results[material]["bulkmod"]["B"], float)
         assert isinstance(results[material]["elastic"]["B_VRH"], float)
@@ -130,6 +135,7 @@ def test_vmg_with_skipping(tmpdir):
     vmg = VaspManager(
         calculation_types=calculation_types,
         material_paths=material_paths,
+        use_multiprocessing=True,
         to_rerun=True,
         to_submit=True,
     )
@@ -137,8 +143,10 @@ def test_vmg_with_skipping(tmpdir):
     for material in results:
         for calc_type in calculation_types:
             match calc_type:
-                case "rlx-coarse" | "rlx":
+                case "rlx-coarse":
                     assert results[material][calc_type] == "done"
+                case "rlx":
+                    assert isinstance(results[material][calc_type]["total_dV"], float)
                 case "static" | "bulkmod":
                     assert results[material][calc_type] is None
                 case "elastic":

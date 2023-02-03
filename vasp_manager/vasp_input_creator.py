@@ -23,7 +23,16 @@ class VaspInputCreator:
     """
 
     def __init__(
-        self, calc_path, mode, poscar_source_path, name=None, increase_nodes=False
+        self,
+        calc_path,
+        mode,
+        poscar_source_path,
+        primitive=True,
+        name=None,
+        increase_nodes_by_factor=1,
+        increase_walltime_by_factor=1,
+        poscar_significant_figures=8,
+        ncore_per_node_for_memory=0,
     ):
         """
         Args:
@@ -31,13 +40,18 @@ class VaspInputCreator:
             mode
             poscar_source_path
             name
-            increase_nodes
+            increase_nodes_by_factor
+            poscar_significant_figures
         """
         self.calc_path = calc_path
         self.poscar_source_path = poscar_source_path
-        self.increase_nodes = increase_nodes
+        self.primitive = primitive
+        self.increase_nodes_by_factor = int(increase_nodes_by_factor)
+        self.increase_walltime_by_factor = int(increase_walltime_by_factor)
         self.name = name
         self.mode = self._get_mode(mode)
+        self.poscar_significant_figures = poscar_significant_figures
+        self.ncore_per_node_for_memory = ncore_per_node_for_memory
 
     def _get_mode(self, mode):
         # rlx-coarse, rlx, bulkmod, stc, or elastic
@@ -81,8 +95,16 @@ class VaspInputCreator:
 
     @cached_property
     def source_structure(self):
+        num_archives = len(glob.glob(os.path.join(self.calc_path, "archive*")))
+        if num_archives > 0:
+            archive_name = f"archive_{num_archives-1}"
+            self.poscar_source_path = os.path.join(
+                self.calc_path, archive_name, "CONTCAR"
+            )
         try:
-            structure = get_pmg_structure_from_poscar(self.poscar_source_path)
+            structure = get_pmg_structure_from_poscar(
+                self.poscar_source_path, primitive=self.primitive
+            )
         except Exception as e:
             raise Exception(f"Cannot load POSCAR in {self.poscar_source_path}: {e}")
         return structure
@@ -118,17 +140,18 @@ class VaspInputCreator:
         """
         poscar = Poscar(self.source_structure)
         poscar_path = os.path.join(self.calc_path, "POSCAR")
-        poscar.write_file(poscar_path)
+        poscar.write_file(
+            poscar_path, significant_figures=self.poscar_significant_figures
+        )
 
     @property
     def n_nodes(self):
         # start with 1 node per 32 atoms
         num_nodes = (len(self.source_structure) // 32) + 1
         if self.computer == "quest":
-            # quest has small nodes
-            num_nodes *= 2
-        if self.increase_nodes:
-            num_nodes *= 2
+            # quest has 4x smaller nodes than perlmutter
+            num_nodes *= 4
+        num_nodes *= self.increase_nodes_by_factor
         return num_nodes
 
     @property
@@ -138,15 +161,16 @@ class VaspInputCreator:
         n_procs = (
             self.n_nodes * self.computing_config_dict[self.computer]["ncore_per_node"]
         )
-        if self.increase_nodes:
-            n_procs *= 2
+        n_procs *= self.increase_nodes_by_factor
         return n_procs
 
     @property
     def n_procs_used(self):
-        return self.n_nodes * (
-            self.computing_config_dict[self.computer]["ncore_per_node"] - 4
-        )
+        ncore_per_node = self.computing_config_dict[self.computer]["ncore_per_node"]
+        if self.mode == "elastic":
+            if self.computer == "quest":
+                self.ncore_per_node_for_memory += 8
+        return self.n_nodes * (ncore_per_node - self.ncore_per_node_for_memory)
 
     def make_potcar(self):
         """
@@ -182,6 +206,12 @@ class VaspInputCreator:
         incar_path = os.path.join(self.calc_path, "INCAR")
         ncore = self.computing_config_dict[self.computer]["ncore"]
         calc_config = self.calc_config_dict[self.mode]
+
+        if calc_config["ispin"] != 1:
+            raise NotImplementedError("ISPIN = 2 not yet supported")
+
+        if calc_config["iopt"] != 0 and calc_config["potim"] != 0:
+            raise RuntimeError("To use IOPT != 0, POTIM must be set to 0")
 
         # read POTCAR
         potcar_path = os.path.join(self.calc_path, "POTCAR")
@@ -251,9 +281,9 @@ class VaspInputCreator:
         else:
             jobname = pad_string + self.name
 
-        if self.increase_nodes:
+        if self.increase_walltime_by_factor != 1:
             hours, minutes, seconds = walltime.split(":")
-            hours = str(int(hours) * 2)
+            hours = str(int(hours) * self.increase_walltime_by_factor)
             walltime = ":".join([hours, minutes, seconds])
 
         computer_config = self.computing_config_dict[self.computer].copy()
@@ -279,48 +309,32 @@ class VaspInputCreator:
     def make_archive_and_repopulate(self):
         """
         Make an archive of a VASP calculation and copy back over relevant files
-
-        Returns:
-            archive_made (bool): if job was never submitted or failed immediately,
-                return False
         """
-        # if job was never submitted, don't make an archive
-        jobid_path = os.path.join(self.calc_path, "jobid")
-        if not os.path.exists(jobid_path):
-            return False
-        # check if CONTCAR is empty -- calculation failed almost immediately
-        # if it is empty, don't make an archive, just recreate the files
-        # by returning False
-        contcar_path = os.path.join(self.calc_path, "CONTCAR")
-        if not os.path.exists(contcar_path):
-            logger.error(
-                f"CONTCAR in {contcar_path} did not exist.\nAttempting to rerun but it's"
-                " likely there was an immediate job failure!"
-            )
-            shutil.rmtree(self.calc_path)
-            return False
-        else:
-            if os.stat(contcar_path).st_size == 0:
-                logger.error(
-                    f"CONTCAR in {contcar_path} was empty.\nAttempting to rerun but it's"
-                    " likely there was an immediate job failure!"
-                )
-                shutil.rmtree(self.calc_path)
-                return False
-
         with change_directory(self.calc_path):
-            num_archives = len(glob.glob("archive*"))
-            all_files = [d for d in glob.glob("*") if os.path.isfile(d)]
-            archive_name = f"archive_{num_archives}"
-            logger.info(f"Making {archive_name}...")
-            os.mkdir(archive_name)
-            for f in all_files:
-                shutil.move(f, archive_name)
+            contcar_path = "CONTCAR"
+            contcar_exists = os.path.exists(contcar_path)
+            if contcar_exists:
+                contcar_is_empty = os.stat(contcar_path).st_size == 0
+            else:
+                contcar_is_empty = True
 
-        contcar_path = os.path.join(self.calc_path, archive_name, "CONTCAR")
-        self.poscar_source_path = contcar_path
+            if contcar_is_empty:
+                # if CONTCAR is empty, don't make an archive and clean up
+                all_files = [d for d in glob.glob("*") if os.path.isfile(d)]
+                for f in all_files:
+                    os.remove(f)
+            else:
+                # make the archive
+                num_previous_archives = len(glob.glob("archive*"))
+                archive_name = f"archive_{num_previous_archives}"
+                logger.info(f"Making {archive_name}...")
+                os.mkdir(archive_name)
+
+                all_files = [d for d in glob.glob("*") if os.path.isfile(d)]
+                for f in all_files:
+                    shutil.move(f, archive_name)
+
         self.create()
-        return True
 
     def create(self):
         """

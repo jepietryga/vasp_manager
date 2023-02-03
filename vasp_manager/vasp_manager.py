@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from functools import cached_property
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 
 import numpy as np
 from tqdm import tqdm
@@ -37,9 +37,10 @@ class VaspManager:
         to_submit=True,
         ignore_personal_errrors=True,
         tail=5,
-        ncore=None,
         use_multiprocessing=False,
+        ncore=None,
         calculation_manager_kwargs={},
+        max_reruns=3,
     ):
         """
         Args:
@@ -50,19 +51,16 @@ class VaspManager:
             to_submit (bool): if True, submit calculations
             ignore_personal_errors (bool): if True, ignore job submission errors
                 if on personal computer
-            tail (int): number of last lines to log in debugging if job failed
-            ncore (int): if ncore, use {ncore} for multiprocessing
-                if None, defaults to minimum(number of materials, cpu_count)
+            tail (int): number of last lines from stdout.txt to log in debugging
+                if job failed
             use_multiprocessing (bool): if True, use pool.map()
-                Can be useful to set to false for debugging
-                WARNING
-                I've had issues with job submission using multiprocessing, so consider
-                it an experimental feature for now
-                \\TODO: use a multiprocessing queue manager to handle the jobs
-                to ensure concurrency isn't an issue
+            ncore (int): if ncore, use {ncore} for multiprocessing
+                if None, defaults to minimum(number of materials, 4)
             calculation_manager_kwargs (dict): contains subdictionaries for each
                 calculation type. Eeach subdictorary can be filled with extra kwargs
                 to pass to its associated CalculationManager during instantiation
+            max_reruns (int): the maximum number of times a rlx-coarse or rlx
+                calculation can run before refusing to continue
         """
         self.calculation_types = calculation_types
         self.material_paths = material_paths
@@ -70,13 +68,10 @@ class VaspManager:
         self.to_submit = to_submit
         self.ignore_personal_errors = ignore_personal_errrors
         self.tail = tail
-        self.ncore = (
-            ncore
-            if ncore is not None
-            else int(np.min([len(self.material_paths), cpu_count()]))
-        )
         self.use_multiprocessing = use_multiprocessing
+        self.ncore = ncore
         self.calculation_manager_kwargs = calculation_manager_kwargs
+        self.max_reruns = max_reruns
 
         self.calculation_managers = self._get_all_calculation_managers()
         self.results_path = os.path.join(self.base_path, "results.json")
@@ -98,6 +93,15 @@ class VaspManager:
 
     @ncore.setter
     def ncore(self, value):
+        if value is None:
+            value = int(np.min([len(self.material_paths), 4]))
+            if self.use_multiprocessing:
+                print(
+                    "WARNING: setting default ncore for multiprocessing to "
+                    + f"{value}\n"
+                    + "    We strongly recommend you set ncore to the number of "
+                    + "available cores."
+                )
         if not isinstance(value, int):
             raise Exception
         self._ncore = value
@@ -193,9 +197,9 @@ class VaspManager:
             is_done (bool)
         """
         match calc_type:
-            case "rlx-coarse" | "rlx":
+            case "rlx-coarse":
                 is_done = self.results[material_name][calc_type] == "done"
-            case "static" | "bulkmod" | "elastic":
+            case "rlx" | "static" | "bulkmod" | "elastic":
                 is_done = self.results[material_name][calc_type] is not None
             case _:
                 raise ValueError("Can't find mode {mode} in result")
@@ -215,6 +219,7 @@ class VaspManager:
                         to_submit=self.to_submit,
                         ignore_personal_errors=self.ignore_personal_errors,
                         tail=self.tail,
+                        max_reruns=self.max_reruns,
                         **self.calculation_manager_kwargs[calc_type],
                     )
                 case "rlx":
@@ -229,6 +234,7 @@ class VaspManager:
                         ignore_personal_errors=self.ignore_personal_errors,
                         from_coarse_relax=from_coarse_relax,
                         tail=self.tail,
+                        max_reruns=self.max_reruns,
                         **self.calculation_manager_kwargs[calc_type],
                     )
                 case "static":
@@ -256,7 +262,7 @@ class VaspManager:
                                 "bulkmod_standalone must be run alone -- remove other"
                                 " calculation types to fix"
                             )
-                            raise Exception()
+                            raise Exception(msg)
                     manager = BulkmodCalculationManager(
                         material_path=material_path,
                         to_rerun=self.to_rerun,
@@ -268,7 +274,7 @@ class VaspManager:
                 case "elastic":
                     if "rlx" not in self.calculation_types:
                         msg = (
-                            "Cannot perform elastic calculation without mode='rlx-fine'"
+                            "Cannot perform elastic calculation without mode='rlx'"
                             " first"
                         )
                         raise Exception(msg)
@@ -299,8 +305,13 @@ class VaspManager:
         """
         Runs vasp job workflow for a single material
         """
+        material_results = {}
         for calc_manager in self.calculation_managers[material_name]:
             if calc_manager.mode in self.results[material_name].keys():
+                if calc_manager.stopped:
+                    logger.info(f"{material_name} -- STOPPED")
+                    break
+
                 calc_is_done = self._check_calc_by_result(
                     material_name, calc_manager.mode
                 )
@@ -331,34 +342,39 @@ class VaspManager:
                         # independent of each other
                         pass
 
-            self.results[material_name][calc_manager.mode] = calc_manager.results
+            material_results[calc_manager.mode] = calc_manager.results
+        return (material_name, material_results)
 
     def _manage_calculations_wrapper(self):
         if self.use_multiprocessing:
             with Pool(self.ncore) as pool:
-                pool.map(self._manage_calculations, tqdm(self.material_names))
+                results = pool.map(self._manage_calculations, tqdm(self.material_names))
         else:
+            results = []
             for i, material_name in enumerate(self.material_names):
                 print(f"{i+1}/{len(self.material_names)} -- {material_name}")
-                self._manage_calculations(material_name)
+                results.append(self._manage_calculations(material_name))
                 logger.info("")
                 logger.info("")
                 logger.info("")
+        return results
 
     def run_calculations(self):
         """
         Runs vasp job workflow for all materials
         """
-        self._manage_calculations_wrapper()
+        results = self._manage_calculations_wrapper()
+        for material_name, material_result in results:
+            self.results[material_name].update(material_result)
 
-        json_str = json.dumps(self.results, indent=2, cls=NumpyEncoder, sort_keys=True)
+        json_str = json.dumps(self.results, indent=2, cls=NumpyEncoder)
         logger.debug(json_str)
         with open(self.results_path, "w+") as fw:
             fw.write(json_str)
         print(f"Dumped to {self.results_path}")
         return self.results
 
-    def summary(self, as_string=True):
+    def summary(self, as_string=True, print_unfinished=False):
         """
         Create a string summary of all calculations
 
@@ -400,7 +416,16 @@ class VaspManager:
             for calc_type in self.calculation_types:
                 name = calc_type.upper()
                 n_finished = summary_dict[calc_type]["n_finished"]
-                summary_str += f"{name: <12} {n_finished}/{n_materials} completed\n"
+                summary_str += f"{name: <12}{n_finished}/{n_materials} completed\n"
+                if print_unfinished:
+                    unfinished = summary_dict[calc_type]["unfinished"]
+                    if len(unfinished) != 0:
+                        summary_str += (
+                            " " * 12 + f"{n_materials - n_finished} not completed\n"
+                        )
+                        summary_str += (
+                            f"Unfinished {calc_type.upper()}: " + f"{unfinished}\n"
+                        )
             return summary_str
         else:
             return summary_dict
