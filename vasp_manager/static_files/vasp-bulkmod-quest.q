@@ -20,7 +20,7 @@ starttime=$(date +%s)
 mpi_tasks=$(echo "$SLURM_NTASKS * 24/28" | bc)
 for p in strain*; do
     cd $p
-    mpirun -np $mpi_tasks vasp_std > stdout.txt 2> stderr.txt
+    mpirun -np $mpi_tasks $vasp_std > stdout.txt 2> stderr.txt
     cd ..
 done
 

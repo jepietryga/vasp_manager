@@ -7,6 +7,8 @@ import logging
 import os
 import pkgutil
 import shutil
+import warnings
+from datetime import time, timedelta
 from functools import cached_property
 
 import numpy as np
@@ -60,6 +62,23 @@ class VaspInputCreator:
         if "bulkmod" in mode:
             mode = "bulkmod"
         return mode
+
+    def _get_lmaxmix(self, composition_dict):
+        d_f_block = json.loads(
+            pkgutil.get_data(
+                "vasp_manager", os.path.join("static_files", "d_f_block.json")
+            ).decode("utf-8")
+        )
+        d_block_elements = d_f_block["d_block"]
+        f_block_elements = d_f_block["f_block"]
+        lmaxmix = 2
+        for element in composition_dict:
+            if element in d_block_elements:
+                lmaxmix = 4
+        for element in composition_dict:
+            if element in f_block_elements:
+                lmaxmix = 6
+        return lmaxmix
 
     @cached_property
     def calc_config_dict(self):
@@ -161,7 +180,6 @@ class VaspInputCreator:
         n_procs = (
             self.n_nodes * self.computing_config_dict[self.computer]["ncore_per_node"]
         )
-        n_procs *= self.increase_nodes_by_factor
         return n_procs
 
     @property
@@ -213,24 +231,30 @@ class VaspInputCreator:
         if calc_config["iopt"] != 0 and calc_config["potim"] != 0:
             raise RuntimeError("To use IOPT != 0, POTIM must be set to 0")
 
+        composition_dict = self.source_structure.composition.as_dict()
         # read POTCAR
         potcar_path = os.path.join(self.calc_path, "POTCAR")
-        potcar = Potcar.from_file(potcar_path)
-        composition_dict = self.source_structure.composition.as_dict()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            potcar = Potcar.from_file(potcar_path)
         n_electrons = 0
         for potcar_single in potcar:
             n_electrons += (
                 potcar_single.nelectrons * composition_dict[potcar_single.element]
             )
         # make n_bands divisible by NCORE (VASP INCAR tag)
-        nbands = int(np.ceil(0.75 * n_electrons / ncore) * ncore)
+        calc_config["ncore"] = ncore
+        calc_config["nbands"] = int(np.ceil(0.75 * n_electrons / ncore) * ncore)
+        lmaxmix = self._get_lmaxmix(composition_dict)
 
-        # Add lines to the vaspq file for only elastic calculations
-        incar_tmp = self.incar_template
-        if self.mode == "elastic":
+        # Add lines to the vaspq file
+        incar_tmp = self.incar_template.split("\n")
+        for i, line in enumerate(incar_tmp):
             # add extra flags for elastic mode
-            incar_tmp = incar_tmp.split("\n")
-            for i, line in enumerate(incar_tmp):
+            if "LASPH" in line:
+                lmaxmix_line = f"LMAXMIX = {lmaxmix}"
+                incar_tmp.insert(i + 1, lmaxmix_line)
+            if self.mode == "elastic":
                 if "KSPACING" in line:
                     nfree_line = "NFREE = {nfree}"
                     symprec_line = "SYMPREC = {symprec}"
@@ -239,8 +263,8 @@ class VaspInputCreator:
                 if "NCORE" in line:
                     # elastic calculation won't run unless NCORE=1
                     incar_tmp[i] = "NCORE = 1"
-            incar_tmp = "\n".join([line for line in incar_tmp])
-        incar = incar_tmp.format(**calc_config, ncore=ncore, nbands=nbands)
+        incar_tmp = "\n".join([line for line in incar_tmp])
+        incar = incar_tmp.format(**calc_config)
         logger.debug(incar)
         with open(incar_path, "w+") as fw:
             fw.write(incar)
@@ -251,7 +275,6 @@ class VaspInputCreator:
         """
         vaspq_path = os.path.join(self.calc_path, "vasp.q")
         calc_config = self.calc_config_dict[self.mode]
-        walltime = calc_config["walltime"]
 
         # create pad string for job naming to differentiate in the queue
         match self.mode:
@@ -281,10 +304,23 @@ class VaspInputCreator:
         else:
             jobname = pad_string + self.name
 
-        if self.increase_walltime_by_factor != 1:
-            hours, minutes, seconds = walltime.split(":")
-            hours = str(int(hours) * self.increase_walltime_by_factor)
-            walltime = ":".join([hours, minutes, seconds])
+        # convert walltime into seconds for increase_walltime_by_factor
+        walltime_iso = time.fromisoformat(calc_config["walltime"])
+        # walltime_duration is in seconds
+        walltime_duration = timedelta(
+            hours=walltime_iso.hour,
+            minutes=walltime_iso.minute,
+            seconds=walltime_iso.second,
+        )
+        walltime_duration *= self.increase_walltime_by_factor
+        # convert to HH:MM:SS
+        walltime = str(walltime_duration)
+        # cut walltime short by 1 minute so job metrics log properly
+        timeout = walltime_duration.seconds - 60
+        # quest uses mpirun which needs timeout in seconds
+        # otherwise, convert it back to HH:MM:SS
+        if not self.computer == "quest":
+            timeout = str(timedelta(seconds=timeout))
 
         computer_config = self.computing_config_dict[self.computer].copy()
         ncore_per_node = self.n_procs_used // self.n_nodes
@@ -294,6 +330,8 @@ class VaspInputCreator:
                 "n_procs": self.n_procs,
                 "ncore_per_node": ncore_per_node,
                 "jobname": jobname,
+                "walltime": walltime,
+                "timeout": timeout,
             }
         )
 
@@ -301,7 +339,7 @@ class VaspInputCreator:
         vaspq_tmp = pkgutil.get_data(
             "vasp_manager", os.path.join("static_files", q_name)
         ).decode("utf-8")
-        vaspq = vaspq_tmp.format(**computer_config, walltime=walltime)
+        vaspq = vaspq_tmp.format(**computer_config)
         logger.debug(vaspq)
         with open(vaspq_path, "w+") as fw:
             fw.write(vaspq)
