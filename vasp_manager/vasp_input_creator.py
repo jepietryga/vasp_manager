@@ -225,11 +225,12 @@ class VaspInputCreator:
         ncore = self.computing_config_dict[self.computer]["ncore"]
         calc_config = self.calc_config_dict[self.mode]
 
-        if calc_config["ispin"] != 1:
-            raise NotImplementedError("ISPIN = 2 not yet supported")
-
-        if calc_config["iopt"] != 0 and calc_config["potim"] != 0:
-            raise RuntimeError("To use IOPT != 0, POTIM must be set to 0")
+        if "ispin" in calc_config:
+            if calc_config["ispin"] != 1:
+                raise NotImplementedError("ISPIN = 2 not yet supported")
+        if "iopt" in calc_config and "potim" in calc_config:
+            if calc_config["iopt"] != 0 and calc_config["potim"] != 0:
+                raise RuntimeError("To use IOPT != 0, POTIM must be set to 0")
 
         composition_dict = self.source_structure.composition.as_dict()
         # read POTCAR
@@ -243,28 +244,21 @@ class VaspInputCreator:
                 potcar_single.nelectrons * composition_dict[potcar_single.element]
             )
         # make n_bands divisible by NCORE (VASP INCAR tag)
+        calc_config["comment_core"] = "Core handling"
         calc_config["ncore"] = ncore
         calc_config["nbands"] = int(np.ceil(0.75 * n_electrons / ncore) * ncore)
         lmaxmix = self._get_lmaxmix(composition_dict)
 
-        # Add lines to the vaspq file
-        incar_tmp = self.incar_template.split("\n")
-        for i, line in enumerate(incar_tmp):
-            # add extra flags for elastic mode
-            if "LASPH" in line:
-                lmaxmix_line = f"LMAXMIX = {lmaxmix}"
-                incar_tmp.insert(i + 1, lmaxmix_line)
-            if self.mode == "elastic":
-                if "KSPACING" in line:
-                    nfree_line = "NFREE = {nfree}"
-                    symprec_line = "SYMPREC = {symprec}"
-                    incar_tmp.insert(i + 1, symprec_line)
-                    incar_tmp.insert(i + 1, nfree_line)
-                if "NCORE" in line:
-                    # elastic calculation won't run unless NCORE=1
-                    incar_tmp[i] = "NCORE = 1"
-        incar_tmp = "\n".join([line for line in incar_tmp])
-        incar = incar_tmp.format(**calc_config)
+        incar = ""
+
+        for item,val in calc_config.items():
+            if "walltime" == item.upper():
+                continue
+            if "comment" in item:
+                add_str = f"\n#= {val} =#\n"
+            else:
+                add_str = f"{item.upper()} = {val}\n"
+            incar += add_str
         logger.debug(incar)
         with open(incar_path, "w+") as fw:
             fw.write(incar)
