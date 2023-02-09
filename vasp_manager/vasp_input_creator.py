@@ -169,8 +169,11 @@ class VaspInputCreator:
         num_nodes = (len(self.source_structure) // 32) + 1
         if self.computer == "quest":
             # quest has 4x smaller nodes than perlmutter
-            num_nodes *= 4
+            num_nodes *= 1
         num_nodes *= self.increase_nodes_by_factor
+
+        if num_nodes > 8:
+            num_nodes = 8
         return num_nodes
 
     @property
@@ -203,7 +206,7 @@ class VaspInputCreator:
             os.path.join(potcar_dir, self.potcar_dict[el_name], "POTCAR")
             for el_name in el_names
         ]
-        for pot_single in pot_singles:
+        for pot_sisrun -t {timeout} -ungle in pot_singles:
             if not os.path.exists(pot_single):
                 msg = "Unable to create POTCAR"
                 msg += f"\n\t POTCAR not found at path {pot_single}"
