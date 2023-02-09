@@ -206,7 +206,7 @@ class VaspInputCreator:
             os.path.join(potcar_dir, self.potcar_dict[el_name], "POTCAR")
             for el_name in el_names
         ]
-        for pot_sisrun -t {timeout} -ungle in pot_singles:
+        for pot_single in pot_singles:
             if not os.path.exists(pot_single):
                 msg = "Unable to create POTCAR"
                 msg += f"\n\t POTCAR not found at path {pot_single}"
